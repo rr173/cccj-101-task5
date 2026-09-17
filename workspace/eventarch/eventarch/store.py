@@ -30,6 +30,7 @@ from queue import Queue
 from typing import Dict, List, Optional, Tuple
 
 from . import gc as gcmod
+from . import groups as groupsmod
 from . import segments as segmod
 from . import wal as walmod
 from .models import fmt_ts, new_flags, parse_ts, utcnow, validate_event
@@ -128,6 +129,9 @@ class ArchiveStore:
         # Capacity reclamation (GC plans/jobs/audit) and reader holds live
         # in their own manager; its durable state is reconciled in open().
         self.gc = gcmod.GCManager(self)
+        # Persistent consumer groups (declarations, checkpoints, epochs,
+        # pending batches, reclamation gates); reconciled in open() too.
+        self.groups = groupsmod.GroupManager(self)
 
         self._lock = threading.RLock()
         # Notified on every repair-job terminal transition (used by wait_repair).
@@ -192,6 +196,11 @@ class ArchiveStore:
         #    the manifest (orphans / stale staging dirs).  Must run BEFORE
         #    verification so every decision is based on the reconciled files.
         self._recover_repairs()
+
+        # 0b. load consumer-group declarations (checkpoints, epochs, leases,
+        #     pending batches) and reconcile the gate ledger with them, so
+        #     no orphaned or stale reclamation gate survives a crash.
+        self.groups.recover()
 
         changed = False
         # 1. verify sealed segments, load their indexes
@@ -1589,6 +1598,7 @@ class ArchiveStore:
                 },
                 "freezes": len(self._freezes),
                 "gc": self.gc._stats_locked(),
+                "groups": self.groups._stats_locked(),
                 "repairs": {
                     "active": len(self._active_repairs),
                     "queued": sum(1 for j in self._repairs.values()

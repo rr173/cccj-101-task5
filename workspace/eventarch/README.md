@@ -91,6 +91,13 @@ make smoke    # 端到端：起服务→分类→冻结→重启→损坏→隔�
 | `GET /v1/gc/audit?limit=` | 成功清退项的持久审计（JSONL 追加，每条目一行 fsync） |
 | `POST /v1/holds` | 创建/幂等续期读者保护区：`{hold_id, pos, ttl_seconds}`，保护 `pos` 所在项及更大位置 |
 | `GET /v1/holds` · `DELETE /v1/holds/{id}` | 保护区列表 / 主动解除 |
+| `POST /v2/groups` | 登记持久消费组 `{name, start, end?, lease_seconds}`；同样声明沿用原对象，相异声明占用旧名 `409`；起点落入废弃区 `410` 附精确可用起点 |
+| `GET /v2/groups` · `GET /v2/groups/{name}` | 消费组清单 / 详情（checkpoint、epoch、持有者、待交卷批次、水闸） |
+| `POST /v2/groups/{name}/claim` | 领取一批 `{batch_key, lease_key, epoch, messages, gaps, next_at}`；领取不移动 checkpoint；未交卷前重复领取返回同一批 |
+| `POST /v2/groups/{name}/renew` | 续租（`{holder, lease_key}`）；epoch 不变 |
+| `POST /v2/groups/{name}/settle` | 交卷 `{holder, lease_key, batch_key, next_at}`；重复提交视为办妥；倒退/跨批/虚构批号/失效凭证 `409` 且 checkpoint 不动 |
+| `POST /v2/groups/{name}/pause` · `POST /v2/groups/{name}/resume` | 暂停（撤水闸、释放租约）/ 从原 checkpoint 恢复 |
+| `DELETE /v2/groups/{name}` | 注销：撤水闸、删除登记 |
 | `GET /v1/stats` · `GET /v1/healthz` | 运行指标（含 `gc` 段）/ 健康检查 |
 
 ### 冻结与回放
@@ -233,6 +240,50 @@ state/holds.json     # 读者保护区（含过期时刻）
 segments/gcgrave-<job>/<seg>/   # 目录换位后、audit 前的临时墓场
 ```
 
+## 持久消费组（/v2/groups）
+
+为下游算子提供的持久订阅：一次登记声明，随后由唯一持有者按批领取、交卷；
+声明、checkpoint、epoch、租约与待交卷批次全部落盘。
+
+```bash
+# 1. 登记：名称、起始号、可选静态终点、租约秒数
+curl -XPOST localhost:8080/v2/groups \
+  -d '{"name":"etl","start":0,"end":100000,"lease_seconds":30}'
+
+# 2. 领取一批（领取本身不移动 checkpoint）
+curl -XPOST localhost:8080/v2/groups/etl/claim -d '{"holder":"worker-1","limit":500}'
+# -> {"batch_key":"bt-…","lease_key":"lk-…","epoch":1,
+#     "messages":[...],"gaps":[],"next_at":500}
+
+# 3. 交卷：仅当前持有者可提交该批给出的 next_at
+curl -XPOST localhost:8080/v2/groups/etl/settle \
+  -d '{"holder":"worker-1","lease_key":"lk-…","batch_key":"bt-…","next_at":500}'
+```
+
+语义要点：
+
+- **登记幂等**：同样声明再次登记沿用原对象；相异声明占用旧名 `409`。
+  起点已落入废弃区 → `410` 并附精确可用起点 `cursor`，绝不暗中跳跃。
+- **至少一次**：批次未交卷前，重复领取（含重启后、租约接管后）都返回同一
+  `batch_key` 的原批次；交卷后下一批才出现。`gaps[]` 显式标注隔离/已清退
+  区间（带 `resume_offset`），绝不静默跳过。
+- **单持有者**：每组同一时刻仅一名生效持有者。原持有者延租 epoch 不变；
+  租约过期后新持有者接管并取得递增 epoch、换发 `lease_key`，旧持有者此后
+  的领取、延租、交卷一律 `409`。
+- **交卷守卫**：仅当前持有者可提交该批给出的 `next_at`；再次提交视为办妥
+  （幂等无副作用）；倒退、跨批、虚构批号、失效凭证均 `409`，checkpoint
+  原封不动。
+- **回收水闸**：系统从 checkpoint 自动派生水闸（段粒度），尚待交卷与尚未
+  读取的消息不会被容量清退移除；交卷后水闸前移；暂停或注销即撤掉；静态组
+  抵达终点永久结束（水闸随之释放），看不到随后到达的消息，动态组则追随
+  新增消息。
+- **落盘与对账**：`state/groups.json`（声明/checkpoint/epoch/租约/待交卷
+  批次）先于 `state/group_gates.json`（水闸台账）写入；崩溃后启动对账保证
+  水闸与 checkpoint 对齐、不留无人持有的水闸、已交卷批次不再出现、
+  checkpoint 不被推进两遍。
+- **不阻塞前台**：领取的段扫描 I/O 在全局锁外进行（与 replay 相同），订阅
+  不会拖慢常规接入、查找、冻结、整治或容量回收。
+
 ## 持久化与故障语义
 
 ```
@@ -248,6 +299,8 @@ $data_dir/
   state/gc.json                    # 清退作业持久意图日志（三阶段崩溃对账/幂等依据）
   state/gc_audit.log              # 成功清退项的 JSONL 追加审计（每行 fsync）
   state/holds.json                 # 读者保护区（hold_id/pos/边界/过期时刻）
+  state/groups.json                # 消费组声明、checkpoint、epoch、租约、待交卷批次
+  state/group_gates.json           # 回收水闸台账（由 checkpoint 派生，启动对账）
   segments/stage-<job>-<n>/<seg>/  # 修复候选（提交前不触碰 live）
   segments/bak-<job>-<n>/<seg>/    # 原子交换期间的旧段（提交后删除）
   segments/gcgrave-<job>/<seg>/    # GC 目录换位后、audit 前的临时墓场

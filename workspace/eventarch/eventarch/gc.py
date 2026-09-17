@@ -476,6 +476,10 @@ class GCManager:
     def _eligible_metas_locked(self, cut: int, now: float) -> List[dict]:
         snap = self._snapshot_ids_locked()
         active_repairs = set(self.s._active_repairs)
+        # Consumer-group water-gates: segments at or beyond a group's
+        # checkpoint hold unsettled/unread messages and are untouchable.
+        groups = getattr(self.s, "groups", None)
+        group_bounds = groups.gate_boundaries_locked() if groups else []
         out = []
         for m in self.s.manifest["segments"]:
             if m["status"] != "sealed":
@@ -486,6 +490,8 @@ class GCManager:
                     or m["id"] in self._pending:
                 continue
             if self._is_held_locked(m, now):
+                continue
+            if any(m["first_offset"] >= b for b in group_bounds):
                 continue
             out.append(m)
         out.sort(key=lambda m: m["first_offset"])

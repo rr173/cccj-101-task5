@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 
 from . import gc as gcmod
+from . import groups as groupsmod
 from . import store as storemod
 
 log = logging.getLogger("eventarch.api")
@@ -75,6 +76,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(body, status=410)
         except gcmod.PlanConflict as exc:
             self._error(409, str(exc), conflicts=exc.reasons)
+        except groupsmod.GroupConflict as exc:
+            self._error(409, str(exc))
+        except groupsmod.GroupGone as exc:
+            self._error(410, str(exc), cursor=exc.cursor,
+                        first_offset=exc.first_offset,
+                        last_offset=exc.last_offset)
         except gcmod.ReadRetry as exc:
             self._error(503, str(exc), segment=exc.seg_id, retry_after="0")
         except storemod.WalCoverageGone as exc:
@@ -219,5 +226,61 @@ class Handler(BaseHTTPRequestHandler):
 
         if method == "DELETE" and len(parts) == 3 and parts[:2] == ["v1", "holds"]:
             return self._send_json(s.gc.release_hold(parts[2]))
+
+        # -- persistent consumer groups (v2) ---------------------------- #
+
+        if method == "POST" and parts == ["v2", "groups"]:
+            body = self._body_json()
+            if not isinstance(body, dict):
+                raise ValueError("body must be an object")
+            for key in ("name", "start", "lease_seconds"):
+                if key not in body:
+                    raise ValueError(f"body must contain '{key}'")
+            view, created = s.groups.register(
+                body["name"], body["start"], body.get("end"),
+                body["lease_seconds"])
+            return self._send_json(view, status=201 if created else 200)
+
+        if method == "GET" and parts == ["v2", "groups"]:
+            return self._send_json({"groups": s.groups.list_groups()})
+
+        if method == "GET" and len(parts) == 3 and parts[:2] == ["v2", "groups"]:
+            return self._send_json(s.groups.get_group(parts[2]))
+
+        if method == "DELETE" and len(parts) == 3 and parts[:2] == ["v2", "groups"]:
+            return self._send_json(s.groups.delete(parts[2]))
+
+        if method == "POST" and len(parts) == 4 and parts[:2] == ["v2", "groups"]:
+            action = parts[3]
+            body = self._body_json()
+            if not isinstance(body, dict):
+                raise ValueError("body must be an object")
+            if action == "claim":
+                holder = body.get("holder")
+                if not isinstance(holder, str) or not holder:
+                    raise ValueError("body must contain a non-empty 'holder'")
+                limit = _clamp_limit(body.get("limit", 100), 100, 1000)
+                return self._send_json(s.groups.claim(parts[2], holder, limit))
+            if action == "renew":
+                holder = body.get("holder")
+                lease_key = body.get("lease_key")
+                if not isinstance(holder, str) or not holder:
+                    raise ValueError("body must contain a non-empty 'holder'")
+                if not isinstance(lease_key, str) or not lease_key:
+                    raise ValueError("body must contain a 'lease_key'")
+                return self._send_json(
+                    s.groups.renew(parts[2], holder, lease_key))
+            if action == "settle":
+                for key in ("holder", "lease_key", "batch_key", "next_at"):
+                    if key not in body:
+                        raise ValueError(f"body must contain '{key}'")
+                return self._send_json(s.groups.settle(
+                    parts[2], body["holder"], body["lease_key"],
+                    body["batch_key"], body["next_at"]))
+            if action == "pause":
+                return self._send_json(s.groups.pause(parts[2]))
+            if action == "resume":
+                return self._send_json(s.groups.resume(parts[2]))
+            return self._error(404, "not found")
 
         return self._error(404, "not found")
