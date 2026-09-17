@@ -23,6 +23,7 @@ class Config:
     repair_history: int = 100             # finished jobs retained in the journal
     gc_workers: int = 1                   # background eviction-job concurrency
     gc_history: int = 100                 # finished gc jobs retained in the journal
+    group_max_batch: int = 500            # max messages handed out in one claim
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -49,4 +50,5 @@ class Config:
             repair_history=env("EA_REPAIR_HISTORY", cls.repair_history, int),
             gc_workers=env("EA_GC_WORKERS", cls.gc_workers, int),
             gc_history=env("EA_GC_HISTORY", cls.gc_history, int),
+            group_max_batch=env("EA_GROUP_MAX_BATCH", cls.group_max_batch, int),
         )

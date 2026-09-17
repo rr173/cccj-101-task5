@@ -91,6 +91,10 @@ make smoke    # 端到端：起服务→分类→冻结→重启→损坏→隔�
 | `GET /v1/gc/audit?limit=` | 成功清退项的持久审计（JSONL 追加，每条目一行 fsync） |
 | `POST /v1/holds` | 创建/幂等续期读者保护区：`{hold_id, pos, ttl_seconds}`，保护 `pos` 所在项及更大位置 |
 | `GET /v1/holds` · `DELETE /v1/holds/{id}` | 保护区列表 / 主动解除 |
+| `POST /v2/groups` | 登记下游持久消费组 `{name, start, end?, lease_seconds}`（同名同声明幂等，同名异义 `409`，起点废弃 `410`） |
+| `POST /v2/groups/{name}/claim` · `…/settle` · `…/renew` | 领取一批（不移动 checkpoint）/ 当前持有者按批交卷 / 延租（epoch 不变） |
+| `POST /v2/groups/{name}/pause` · `…/resume` · `DELETE /v2/groups/{name}` | 暂停撤水闸 / 恢复续订 / 注销 |
+| `GET /v2/groups` · `GET /v2/groups/{name}` | 消费组清单 / 单组 |
 | `GET /v1/stats` · `GET /v1/healthz` | 运行指标（含 `gc` 段）/ 健康检查 |
 
 ### 冻结与回放
@@ -233,6 +237,79 @@ state/holds.json     # 读者保护区（含过期时刻）
 segments/gcgrave-<job>/<seg>/   # 目录换位后、audit 前的临时墓场
 ```
 
+## 下游持久消费组（API v2）
+
+为下游算子提供命名的、落盘的持久订阅。每个组维护自己的 checkpoint、epoch、
+租约持有者与待交卷批次；**每组任一时刻只有一名生效持有者**。
+
+| 方法/路径 | 说明 |
+|---|---|
+| `POST /v2/groups` | 登记 `{name, start, end?, lease_seconds}`；相同声明再次登记沿用原对象（`200`），同名异义声明 `409`；起点落入已废弃区 `410`（附精确可用起点 `usable_start`），绝不暗中跳跃 |
+| `GET /v2/groups` · `GET /v2/groups/{name}` | 消费组清单 / 单组（checkpoint、epoch、状态、水闸、在途批次） |
+| `POST /v2/groups/{name}/claim` | 领取一批：`{batch_key, lease_key, epoch, messages, gaps, next_at, …}`；领取本身**不移动 checkpoint** |
+| `POST /v2/groups/{name}/settle` | 仅当前持有者可交卷 `{lease_key, batch_key, next_at}`；重复交卷视为办妥 |
+| `POST /v2/groups/{name}/renew` | 当前持有者延租（epoch 不变，可带 `lease_seconds`） |
+| `POST /v2/groups/{name}/pause` · `POST …/resume` | 暂停（撤水闸、吊销租约）/ 恢复（从原 checkpoint 继续，旧凭证作废） |
+| `DELETE /v2/groups/{name}` | 注销：移除声明、在途批次与水闸 |
+
+### 领取、交卷与持有者世代
+
+```bash
+# 1. 登记：start 为起始 offset，end 为可选的排他静态终点
+curl -XPOST localhost:8080/v2/groups \
+  -d '{"name":"downstream-a","start":0,"end":1000,"lease_seconds":30}'
+
+# 2. 领取（可带 limit，默认 EA_GROUP_MAX_BATCH=500，上限 5000）
+curl -XPOST localhost:8080/v2/groups/downstream-a/claim -d '{}'
+# -> {batch_key, lease_key, epoch, checkpoint, messages[], gaps[], next_at, ...}
+
+# 交卷前反复 claim 得到同一批（同一 batch_key/lease_key/epoch）；
+# 3. 只有该批给出的 next_at 可被当前持有者提交
+curl -XPOST localhost:8080/v2/groups/downstream-a/settle \
+  -d '{"lease_key":"ltk-…","batch_key":"btk-…","next_at":500}'
+```
+
+- **在途批次**：交卷前反复 `claim` 返回原批次；交卷后才出现下一批。
+- **交卷校验**（全部失败均 `409` 且 checkpoint 原封不动）：再次提交（同
+  `batch_key` + 同 `next_at`）视为办妥、零副作用；`next_at` 倒退或越批、
+  跨批 / 虚构 `batch_key`、失效或过期 `lease_key` 一律拒绝。
+- **世代（epoch）**：当前持有者延租不改 epoch；租约过期后新的 `claim` 接管并
+  取得**递增** epoch 与全新 `lease_key`，旧持有者此后的领取、延租、交卷全部
+  `409`。交卷后未到期的同一持有者可直接领取下一批。
+- **静态 / 动态**：声明了 `end` 的静态组在 checkpoint 抵达 `end` 后**永久结束**，
+  此后到达的消息不可见（`claim` 返回 `finished:true`）；未声明 `end` 的动态组
+  一直追随新增消息，暂时无数据时返回 `empty:true`。
+- **缺口 gaps**：领取区间跨过被隔离段时显式给出 `gaps[]`（`reason/resume_offset`），
+  消费者可交卷跳过；触及已废弃（evicted）区间返回 `410` 与精确 `cursor`。
+
+### 容量回收水闸（watergate）
+
+系统从每组 checkpoint 自动设置回收水闸：保护**包含 checkpoint 的段以及一切更靠后
+的段**。已领取但尚未交卷的消息因此不可能被容量回收移除；交卷后水闸前移，旧区可被
+清退而未读后缀仍被水闸圈住。暂停或注销时撤掉水闸。水闸与 GC 预演/执行联动：
+水闸覆盖的段不进入 GC 计划；预演后水闸迁移会让整单 apply 返回 `409` 且磁盘原样。
+
+### 落盘与三处断电缝隙
+
+声明、checkpoint、epoch、持有者租约与待交卷批次全部 fsync 落盘。交卷按顺序发布：
+
+1. **批次落盘**（claim 时 `v2_groups.json` + `v2_batches.json`）；
+2. **checkpoint 落盘**（settle 写 `v2_groups.json`）；
+3. **水闸迁移**（清批次账 + 写 `v2_gates.json`）。
+
+在任一步之后强制结束进程，再次开机都满足：**已交卷批次不会再出现；待交卷批次仍使用
+原 batch_key；水闸与 checkpoint 对齐；不遗留无人持有的水闸；checkpoint 不会被推进两遍**。
+启动时以 `v2_groups.json` 内嵌的在途描述为准对账三份文件。
+
+```
+state/v2_groups.json   # 声明/checkpoint/epoch/持有者租约/在途批次描述
+state/v2_batches.json  # 待交卷批次账（崩溃缝隙期间以组记录为准重建/裁剪）
+state/v2_gates.json    # 每组的回收水闸边界（仅 active 组存在）
+```
+
+订阅的重 I/O（逐段扫描）在全局锁之外完成，与常规接入、查找、静态终点生成、整治任务、
+容量回收并行时均及时答复，既有 cursor 含义与静态终点保持不变。
+
 ## 持久化与故障语义
 
 ```
@@ -248,6 +325,9 @@ $data_dir/
   state/gc.json                    # 清退作业持久意图日志（三阶段崩溃对账/幂等依据）
   state/gc_audit.log              # 成功清退项的 JSONL 追加审计（每行 fsync）
   state/holds.json                 # 读者保护区（hold_id/pos/边界/过期时刻）
+  state/v2_groups.json             # 下游消费组（声明/checkpoint/epoch/租约/在途批次）
+  state/v2_batches.json            # 待交卷批次账（batch_key → 描述）
+  state/v2_gates.json              # 每组按 checkpoint 自动设置的回收水闸
   segments/stage-<job>-<n>/<seg>/  # 修复候选（提交前不触碰 live）
   segments/bak-<job>-<n>/<seg>/    # 原子交换期间的旧段（提交后删除）
   segments/gcgrave-<job>/<seg>/    # GC 目录换位后、audit 前的临时墓场
@@ -279,6 +359,7 @@ $data_dir/
 | `EA_REPAIR_HISTORY` | `100` | 作业日志保留的终态作业条数（活动作业不裁剪） |
 | `EA_GC_WORKERS` | `1` | 后台清退作业并发工作线程数 |
 | `EA_GC_HISTORY` | `100` | 清退作业日志保留的终态作业条数（活动作业不裁剪） |
+| `EA_GROUP_MAX_BATCH` | `500` | 单次 claim 最多下发的消息条数（上限 5000） |
 
 ## 设计取舍与限制
 

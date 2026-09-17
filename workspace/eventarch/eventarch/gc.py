@@ -487,6 +487,11 @@ class GCManager:
                 continue
             if self._is_held_locked(m, now):
                 continue
+            # Active v2 consumer groups fence everything from their
+            # checkpoint watergate onward: an outstanding batch's messages
+            # cannot be removed until its settle moves the gate forward.
+            if self.s.groups.is_protected_locked(m) is not None:
+                continue
             out.append(m)
         out.sort(key=lambda m: m["first_offset"])
         return out
@@ -607,6 +612,10 @@ class GCManager:
                                f"{pending_snapshot[m['id']]}")
             if any(m["first_offset"] >= h["boundary"] for h in holds):
                 reasons.append(f"{it['id']}: covered by a reader hold")
+            protecting = self.s.groups.is_protected_locked(m)
+            if protecting is not None:
+                reasons.append(f"{it['id']}: fenced by consumer group "
+                               f"{protecting}")
             try:
                 size = _item_size(self.seg_root, it["id"])
                 content_sha = _events_sha(self.seg_root, it["id"])
@@ -1003,6 +1012,7 @@ class GCManager:
                                 if h["expires_epoch"] > now),
             "evicted_items": len(self.tombstones),
             "bytes_freed": sum(t["size"] for t in self.tombstones),
+            "group_gates": len(self.s.groups.active_gates_locked()),
             "jobs": {
                 "queued": sum(1 for j in self._jobs.values()
                               if j["status"] in ("queued", "running")),

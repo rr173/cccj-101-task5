@@ -30,6 +30,7 @@ from queue import Queue
 from typing import Dict, List, Optional, Tuple
 
 from . import gc as gcmod
+from . import groups as grpmod
 from . import segments as segmod
 from . import wal as walmod
 from .models import fmt_ts, new_flags, parse_ts, utcnow, validate_event
@@ -128,6 +129,9 @@ class ArchiveStore:
         # Capacity reclamation (GC plans/jobs/audit) and reader holds live
         # in their own manager; its durable state is reconciled in open().
         self.gc = gcmod.GCManager(self)
+        # Durable downstream consumer groups (API v2) own the GC watergates
+        # that fence every active group's checkpoint.
+        self.groups = grpmod.GroupsManager(self)
 
         self._lock = threading.RLock()
         # Notified on every repair-job terminal transition (used by wait_repair).
@@ -185,6 +189,12 @@ class ArchiveStore:
         #     publish / audit append windows) BEFORE verification and before
         #     the generic orphan sweep, exactly like repair reconciliation.
         self.gc.recover()
+
+        # 0b. reconcile durable v2 consumer groups (checkpoint / epoch /
+        #     outstanding batches) and rebuild their retention watergates.
+        #     Tombstones are already loaded, so evicted-range checks and gate
+        #     boundaries are based on the reconciled manifest.
+        self.groups.recover()
 
         # 0. finish or roll back any interrupted background repair (crash
         #    between staging, directory swap and manifest commit), load the
@@ -673,6 +683,106 @@ class ArchiveStore:
             "next_from_offset": None if complete else scanned_through + 1,
             "complete": complete,
         }
+
+    def read_claim_window(self, from_offset: int, horizon: int,
+                          limit: Optional[int] = None) -> dict:
+        """Read one consumer-group claim window [from_offset, horizon).
+
+        Gaps come from quarantined segments (durable, business-visible gaps);
+        reaching an evicted tombstone raises gcmod.Gone with the precise
+        resume cursor -- claim/register must turn that into HTTP 410, never a
+        silent skip.  The heavy segment reads run OUTSIDE the global lock, so
+        subscriptions never stall ingestion, lookups, snapshot building,
+        repair work or capacity reclamation.
+
+        Returns events (up to ``limit``), gaps, and next_at: the offset after
+        the last offered message / skipped gap (None when nothing is
+        available).  next_at is computed from offsets only, so it is stable
+        across repeat reads of the same outstanding batch.
+        """
+        with self._lock:
+            metas = [dict(m) for m in self.manifest["segments"]]
+            tombs = [dict(t) for t in self.gc.tombstones]
+            open_snapshot = list(self._open_records)
+
+        units = (
+            [("tomb", t, t["first_offset"]) for t in tombs]
+            + [("seg", m, m["first_offset"]) for m in metas])
+        units.sort(key=lambda u: u[2])
+
+        events: List[dict] = []
+        gaps: List[dict] = []
+        next_at: Optional[int] = None
+        hit_limit = False
+
+        for kind, unit, _first in units:
+            if unit["last_offset"] < from_offset or unit["first_offset"] >= horizon:
+                continue
+            if kind == "tomb":
+                raise gcmod.Gone(
+                    self.gc.cursor_after(max(from_offset, unit["first_offset"])),
+                    unit["first_offset"], unit["last_offset"],
+                    seg_id=unit["id"], reason="evicted")
+            meta = unit
+            if meta["status"] == "quarantined":
+                # Any overlap with the window is an explicit gap -- including
+                # a segment quarantined since the previous batch when the
+                # checkpoint sits mid-segment.  Never skip it silently.
+                if meta["last_offset"] >= from_offset \
+                        and meta["first_offset"] < horizon:
+                    gaps.append({
+                        "segment": meta["id"],
+                        "reason": meta.get("quarantine_reason", ""),
+                        "first_offset": meta["first_offset"],
+                        "last_offset": meta["last_offset"],
+                        "resume_offset": meta["last_offset"] + 1,
+                    })
+                    next_at = max(next_at or 0,
+                                  min(meta["last_offset"], horizon - 1) + 1)
+                continue
+            try:
+                recs, _ = segmod.scan_records(self.seg_root, meta, from_offset)
+            except segmod.SegmentCorrupt as c:
+                self.quarantine(meta["id"], c.reason,
+                                expected_sha=meta.get("sha256"))
+                gaps.append({"segment": meta["id"], "reason": c.reason,
+                             "first_offset": meta["first_offset"],
+                             "last_offset": meta["last_offset"],
+                             "resume_offset": c.resume_offset})
+                next_at = max(next_at or 0,
+                              min(meta["last_offset"], horizon - 1) + 1)
+                continue
+            except FileNotFoundError:
+                tomb = self.gc.tombstone(meta["id"])
+                if tomb is not None:
+                    raise gcmod.Gone(
+                        self.gc.cursor_after(max(from_offset,
+                                                 tomb["first_offset"])),
+                        tomb["first_offset"], tomb["last_offset"],
+                        seg_id=tomb["id"])
+                raise gcmod.ReadRetry(meta["id"])
+            for rec in recs:
+                if rec["offset"] < from_offset or rec["offset"] >= horizon:
+                    continue
+                events.append(rec)
+                next_at = rec["offset"] + 1
+                if limit is not None and len(events) >= limit:
+                    hit_limit = True
+                    break
+            if hit_limit:
+                break
+
+        if not hit_limit:
+            for rec in open_snapshot:
+                if rec["offset"] < from_offset or rec["offset"] >= horizon:
+                    continue
+                events.append(rec)
+                next_at = rec["offset"] + 1
+                if limit is not None and len(events) >= limit:
+                    hit_limit = True
+                    break
+
+        return {"events": events, "gaps": gaps, "next_at": next_at}
 
     # ------------------------------------------------------------------ #
     # queries                                                             #
@@ -1588,6 +1698,7 @@ class ArchiveStore:
                     "gaps": list(self._wal_gaps),
                 },
                 "freezes": len(self._freezes),
+                "groups": self.groups.stats_locked(),
                 "gc": self.gc._stats_locked(),
                 "repairs": {
                     "active": len(self._active_repairs),
@@ -1648,6 +1759,7 @@ class ArchiveStore:
         with self._lock:
             if self._wal is not None:
                 self._wal.close()
+                self._wal = None
         # Wake any synchronous waiters whose job is not going to finish now.
         with self._repair_cv:
             self._repair_cv.notify_all()

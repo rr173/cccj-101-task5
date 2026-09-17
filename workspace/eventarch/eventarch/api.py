@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 
 from . import gc as gcmod
+from . import groups as grpmod
 from . import store as storemod
 
 log = logging.getLogger("eventarch.api")
@@ -72,9 +73,15 @@ class Handler(BaseHTTPRequestHandler):
                     "last_offset": exc.last_offset}
             if exc.seg_id is not None:
                 body["segment"] = exc.seg_id
+            if getattr(exc, "reason", None) is not None:
+                body["reason"] = exc.reason
+                if exc.reason == "start_evicted":
+                    body["usable_start"] = exc.cursor
             self._send_json(body, status=410)
         except gcmod.PlanConflict as exc:
             self._error(409, str(exc), conflicts=exc.reasons)
+        except grpmod.Conflict as exc:
+            self._error(409, str(exc), reason=exc.reason)
         except gcmod.ReadRetry as exc:
             self._error(503, str(exc), segment=exc.seg_id, retry_after="0")
         except storemod.WalCoverageGone as exc:
@@ -219,5 +226,68 @@ class Handler(BaseHTTPRequestHandler):
 
         if method == "DELETE" and len(parts) == 3 and parts[:2] == ["v1", "holds"]:
             return self._send_json(s.gc.release_hold(parts[2]))
+
+        # -- v2: durable downstream consumer groups ---------------------- #
+
+        if method == "POST" and parts == ["v2", "groups"]:
+            body = self._body_json()
+            if not isinstance(body, dict) or "name" not in body \
+                    or "start" not in body:
+                raise ValueError("body must contain 'name' and 'start' "
+                                 "('end' and 'lease_seconds' optional)")
+            if "lease_seconds" not in body:
+                raise ValueError("body must contain 'lease_seconds'")
+            status = None
+            view = s.groups.register(
+                body["name"], body["start"], body.get("end"),
+                body["lease_seconds"])
+            status = 200 if view.pop("redeclared", False) else 201
+            return self._send_json(view, status=status)
+
+        if method == "GET" and parts == ["v2", "groups"]:
+            return self._send_json({"groups": s.groups.list_groups()})
+
+        if method == "GET" and len(parts) == 3 and parts[:2] == ["v2", "groups"]:
+            return self._send_json(s.groups.get_group(parts[2]))
+
+        if method == "DELETE" and len(parts) == 3 and parts[:2] == ["v2", "groups"]:
+            return self._send_json(s.groups.delete_group(parts[2]))
+
+        if method == "POST" and len(parts) == 4 \
+                and parts[:2] == ["v2", "groups"] and parts[3] == "claim":
+            body = self._body_json()
+            if not isinstance(body, dict):
+                body = {}
+            lease_key = body.get("lease_key")
+            limit = body.get("limit")
+            if limit is not None:
+                limit = _clamp_limit(limit, 500, 5000)
+            return self._send_json(s.groups.claim(
+                parts[2], lease_key=lease_key, limit=limit))
+
+        if method == "POST" and len(parts) == 4 \
+                and parts[:2] == ["v2", "groups"] and parts[3] == "settle":
+            body = self._body_json()
+            for key in ("lease_key", "batch_key", "next_at"):
+                if not isinstance(body, dict) or key not in body:
+                    raise ValueError(f"body must contain '{key}'")
+            return self._send_json(s.groups.settle(
+                parts[2], body["lease_key"], body["batch_key"], body["next_at"]))
+
+        if method == "POST" and len(parts) == 4 \
+                and parts[:2] == ["v2", "groups"] and parts[3] == "renew":
+            body = self._body_json()
+            if not isinstance(body, dict) or "lease_key" not in body:
+                raise ValueError("body must contain 'lease_key'")
+            return self._send_json(s.groups.renew(
+                parts[2], body["lease_key"], body.get("lease_seconds")))
+
+        if method == "POST" and len(parts) == 4 \
+                and parts[:2] == ["v2", "groups"] and parts[3] == "pause":
+            return self._send_json(s.groups.pause(parts[2]))
+
+        if method == "POST" and len(parts) == 4 \
+                and parts[:2] == ["v2", "groups"] and parts[3] == "resume":
+            return self._send_json(s.groups.resume(parts[2]))
 
         return self._error(404, "not found")
